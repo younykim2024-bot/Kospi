@@ -1,26 +1,41 @@
 
-# app.py (mobile-first Streamlit)
-# Run: streamlit run app.py
-import os
-import json
-import datetime
+# app.py - Streamlit Cloud safe + KOSPI200 universe auto (via Naver Finance crawl)
+# Why: KRX(data.krx.co.kr) can be "Access Denied" on Streamlit Cloud.
+# Source idea: Naver Finance provides KOSPI200 constituent table pages (/sise/entryJongmok.nhn?page=)
+import os, json, datetime, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-from scipy.signal import argrelextrema
-
-import warnings
-warnings.filterwarnings("ignore")
-
-import FinanceDataReader as fdr
+import requests
+from bs4 import BeautifulSoup
 import yfinance as yf
-
 import plotly.graph_objects as go
 
 # -----------------------------
-# Indicators & pattern logic
+# Pivot detection (no scipy)
+# -----------------------------
+def find_pivots(df, order=5):
+    highs = df["High"].values
+    lows = df["Low"].values
+    pivots = []
+    n = len(df)
+    for i in range(order, n - order):
+        h = highs[i]
+        l = lows[i]
+        if h == np.max(highs[i-order:i+order+1]) and h > np.max(highs[i-order:i]) and h >= np.max(highs[i+1:i+order+1]):
+            pivots.append((i, float(h), "High"))
+        if l == np.min(lows[i-order:i+order+1]) and l < np.min(lows[i-order:i]) and l <= np.min(lows[i+1:i+order+1]):
+            pivots.append((i, float(l), "Low"))
+    pivots.sort(key=lambda x: x[0])
+    dedup = {}
+    for p in pivots:
+        dedup[p[0]] = p
+    return [dedup[k] for k in sorted(dedup.keys())]
+
+# -----------------------------
+# Indicators
 # -----------------------------
 def calculate_rsi(df, period=14):
     delta = df["Close"].diff(1)
@@ -70,17 +85,6 @@ def calculate_adx(df, period=14):
     df["ADX"] = 100 * (di_diff / di_sum).rolling(window=period).mean()
     return df
 
-def find_pivots(df, order=5):
-    high_idx = argrelextrema(df["High"].values, np.greater, order=order)[0]
-    low_idx = argrelextrema(df["Low"].values, np.less, order=order)[0]
-    pivots = []
-    for idx in high_idx:
-        pivots.append((int(idx), float(df["High"].iloc[idx]), "High"))
-    for idx in low_idx:
-        pivots.append((int(idx), float(df["Low"].iloc[idx]), "Low"))
-    pivots.sort(key=lambda x: x[0])
-    return pivots
-
 def detect_harmonic_patterns(df):
     pivots = find_pivots(df, order=5)
     if len(pivots) < 4:
@@ -101,9 +105,9 @@ def detect_harmonic_patterns(df):
         ab_ratio = ab / xa
         bc_ratio = bc / ab
         if 0.45 < ab_ratio < 0.75 and 0.25 < bc_ratio < 0.55:
-            patterns.append({"type":"Gartley","points":[p1,p2,p3,p4]})
+            patterns.append({"type":"Gartley"})
         elif 0.65 < ab_ratio < 0.95 and 1.3 < bc_ratio < 2.0:
-            patterns.append({"type":"Butterfly","points":[p1,p2,p3,p4]})
+            patterns.append({"type":"Butterfly"})
     return patterns if patterns else None
 
 def detect_wolfe_wave_pattern(df):
@@ -143,15 +147,14 @@ def detect_wolfe_wave_pattern(df):
     epa = m * cur_idx + c
     disparity = ((cur_price - epa) / epa) * 100 if epa != 0 else 0.0
 
+    if bull and cur_price >= epa:
+        return {"pattern":"목표 도달","points":last_5,"disparity":round(disparity,2),"rsi":round(rsi,2),"strength":0.0}
+    if bear and cur_price <= epa:
+        return {"pattern":"목표 도달","points":last_5,"disparity":round(disparity,2),"rsi":round(rsi,2),"strength":0.0}
+
     status = "매수" if bull else "매도"
     strength = 1.0
 
-    if bull and cur_price >= epa:
-        return {"pattern":"목표 도달","points":last_5,"disparity":round(disparity,2),"epa_price":epa,"rsi":round(rsi,2),"strength":0.0,"macd":round(macd,4),"stoch_k":round(k,1),"adx":round(adx,1)}
-    if bear and cur_price <= epa:
-        return {"pattern":"목표 도달","points":last_5,"disparity":round(disparity,2),"epa_price":epa,"rsi":round(rsi,2),"strength":0.0,"macd":round(macd,4),"stoch_k":round(k,1),"adx":round(adx,1)}
-
-    # Strength (keep similar flavor)
     if bull:
         if rsi <= 40: strength += 1
         if rsi <= 30: strength += 1
@@ -174,52 +177,71 @@ def detect_wolfe_wave_pattern(df):
     elif strength >= 2.5:
         status = "적극" + status
 
-    return {
-        "pattern": status,
-        "points": last_5,
-        "disparity": round(float(disparity), 2),
-        "epa_price": float(epa),
-        "rsi": round(rsi, 2),
-        "strength": strength,
-        "macd": round(macd, 4),
-        "stoch_k": round(k, 1),
-        "adx": round(adx, 1),
-    }
+    return {"pattern": status, "points": last_5, "disparity": round(float(disparity), 2), "rsi": round(rsi, 2), "strength": strength}
 
 # -----------------------------
-# Data fetch (FDR -> yfinance)
+# Data fetch (yfinance)
 # -----------------------------
 def get_stock_data(code: str, start_year: int):
     start_date = datetime.datetime(start_year, 1, 1)
-    try:
-        df = fdr.DataReader(code, start_date)
-        if df is not None and not df.empty and len(df) > 80:
-            return df
-    except Exception:
-        pass
-
-    try:
-        for suffix in [".KS", ".KQ"]:
-            ticker = f"{code}{suffix}"
+    code6 = str(code).zfill(6)
+    for ticker in [f"{code6}.KS", f"{code6}.KQ", code6]:
+        try:
             df = yf.Ticker(ticker).history(start=start_date, auto_adjust=False, actions=False)
             if df is not None and not df.empty and len(df) > 80:
                 return df
-    except Exception:
-        pass
+        except Exception:
+            continue
     return pd.DataFrame()
 
-@st.cache_data(ttl=60*60*6, show_spinner=False)
-def get_universe(limit_kospi=200):
-    stocks = fdr.StockListing("KOSPI").head(int(limit_kospi))[["Code", "Name"]]
-    etf_codes = [
-        ("069500", "KODEX 200"), ("102110", "TIGER 200"), ("252710", "KODEX KOSPI100"),
-        ("122630", "KODEX 레버리지"), ("123310", "KODEX 인버스"), ("130680", "KODEX 코스닥150"),
-        ("152100", "KODEX 200레버리지"), ("305540", "KODEX 나스닥100"), ("273130", "TIGER 미국나스닥100")
-    ]
-    etf_df = pd.DataFrame(etf_codes, columns=["Code","Name"])
-    combined = pd.concat([stocks, etf_df], ignore_index=True).drop_duplicates(subset=["Code"], keep="first")
-    combined["Code"] = combined["Code"].astype(str).str.zfill(6)
-    return combined.reset_index(drop=True)
+# -----------------------------
+# KOSPI200 list (Naver crawl -> cached csv)
+# -----------------------------
+KOSPI200_CSV = "kospi200.csv"
+
+def load_kospi200_csv():
+    if os.path.exists(KOSPI200_CSV):
+        try:
+            df = pd.read_csv(KOSPI200_CSV, dtype={"Code": str})
+            if "Code" in df.columns:
+                if "Name" not in df.columns:
+                    df["Name"] = df["Code"]
+                df["Code"] = df["Code"].astype(str).str.zfill(6)
+                return df[["Code","Name"]].drop_duplicates(subset=["Code"]).reset_index(drop=True)
+        except Exception:
+            pass
+    return pd.DataFrame(columns=["Code","Name"])
+
+@st.cache_data(ttl=60*60*24, show_spinner=False)
+def fetch_kospi200_from_naver():
+    # Naver Finance entry list pages: 20 pages * 10 rows ≈ 200
+    base = "https://finance.naver.com/sise/entryJongmok.nhn?page={}"
+    headers = {"User-Agent":"Mozilla/5.0"}
+    out = []
+    for page in range(1, 30):  # a bit extra in case pagination changes
+        r = requests.get(base.format(page), headers=headers, timeout=15)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+        # rows: <td class="ctg"><a href="/item/main.naver?code=005930">삼성전자</a></td>
+        for td in soup.select("td.ctg"):
+            a = td.find("a")
+            if not a or not a.get("href"):
+                continue
+            m = re.search(r"code=(\d+)", a["href"])
+            if not m:
+                continue
+            code = m.group(1).zfill(6)
+            name = a.get_text(strip=True)
+            out.append((code, name))
+        # stop early if already >= 200 and no new additions
+        if len(dict(out)) >= 200:
+            break
+    df = pd.DataFrame(list(dict(out).items()), columns=["Code","Name"])
+    df["Code"] = df["Code"].astype(str).str.zfill(6)
+    return df
+
+def save_kospi200_csv(df):
+    df.to_csv(KOSPI200_CSV, index=False, encoding="utf-8")
 
 # -----------------------------
 # Signal history
@@ -263,68 +285,71 @@ def check_consec(h, code, signal, required_days=2):
     return (True, cnt)
 
 # -----------------------------
-# Plotly chart (mobile friendly: pinch-zoom)
+# Plotly chart
 # -----------------------------
 def make_chart(df, points, name, pattern):
-    df = df.copy()
-    df = df.reset_index()
+    df = df.copy().reset_index()
     if "Date" not in df.columns:
         df.rename(columns={"index":"Date"}, inplace=True)
     df["Date"] = pd.to_datetime(df["Date"])
-
-    # focus around pivots
     p_idx = [p[0] for p in points]
     start = max(0, min(p_idx) - 20)
     end = min(len(df), max(p_idx) + 140)
     view = df.iloc[start:end].copy()
-
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(
-        x=view["Date"],
-        open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"],
-        name="OHLC"
-    ))
-    # pivot markers
+    fig.add_trace(go.Candlestick(x=view["Date"], open=view["Open"], high=view["High"], low=view["Low"], close=view["Close"]))
     px = [df["Date"].iloc[p[0]] for p in points]
     py = [p[1] for p in points]
-    fig.add_trace(go.Scatter(x=px, y=py, mode="markers+text", text=[str(i) for i in range(1,6)],
-                             textposition="top center", name="Pivots"))
-    fig.update_layout(
-        title=f"{name} · {pattern}",
-        height=520,
-        margin=dict(l=10,r=10,t=50,b=10),
-        xaxis_rangeslider_visible=False,
-        showlegend=False
-    )
-    fig.update_xaxes(fixedrange=False)
-    fig.update_yaxes(fixedrange=False)
+    fig.add_trace(go.Scatter(x=px, y=py, mode="markers+text", text=[str(i) for i in range(1,6)], textposition="top center"))
+    fig.update_layout(title=f"{name} · {pattern}", height=520, margin=dict(l=10,r=10,t=50,b=10), xaxis_rangeslider_visible=False, showlegend=False)
     return fig
 
 # -----------------------------
-# Mobile-first UI
+# UI
 # -----------------------------
-st.set_page_config(page_title="KOSPI Wolfe (Mobile)", layout="centered")
+st.set_page_config(page_title="KOSPI Wolfe (KOSPI200 auto)", layout="centered")
+st.markdown("<style>section.main > div { padding-top: 0.8rem; }</style>", unsafe_allow_html=True)
 
-# small CSS to improve mobile spacing
-st.markdown("""
-<style>
-section.main > div { padding-top: 0.8rem; }
-div[data-testid="stSidebar"] { padding-top: 0.5rem; }
-</style>
-""", unsafe_allow_html=True)
+st.title("KOSPI Wolfe 스캐너 (모바일/Cloud)")
 
-st.title("KOSPI Wolfe 스캐너 (모바일용)")
+st.info(
+    "이 버전은 **KRX(data.krx.co.kr) 호출을 하지 않습니다.**\\n"
+    "- 기본 스캔 대상: repo에 포함된 `kospi200.csv`\\n"
+    "- 비어있으면: 네이버금융 KOSPI200 구성종목 페이지를 크롤링해 자동 생성합니다."
+)
 
-with st.expander("설정", expanded=True):
-    limit_kospi = st.slider("KOSPI 상위 N개", 50, 300, 200, 10)
+# Universe setup
+with st.expander("스캔 대상", expanded=True):
+    colA, colB = st.columns([1,1])
+    with colA:
+        refresh = st.button("코스피200 리스트 갱신(네이버에서 재수집)", use_container_width=True)
+    with colB:
+        show_list = st.checkbox("코스피200 리스트 보기", value=False)
+
+    kospi200 = load_kospi200_csv()
+    if refresh or kospi200.empty:
+        with st.spinner("네이버 금융에서 코스피200 구성종목을 가져오는 중..."):
+            df_new = fetch_kospi200_from_naver()
+            if len(df_new) >= 150:
+                save_kospi200_csv(df_new)
+                kospi200 = df_new
+                st.success(f"갱신 완료: {len(kospi200)}개")
+            else:
+                st.error(f"가져온 종목 수가 너무 적습니다({len(df_new)}). 네이버 접속이 막혔을 수 있습니다.")
+
+    if show_list and not kospi200.empty:
+        st.dataframe(kospi200, use_container_width=True, hide_index=True, height=300)
+
+    universe = kospi200.copy() if not kospi200.empty else pd.DataFrame(columns=["Code","Name"])
+
+with st.expander("분석 설정", expanded=True):
     start_year = st.selectbox("데이터 시작 연도", [datetime.datetime.now().year - i for i in range(1, 6)], index=1)
     required_days = st.selectbox("연속 신호 기준(거래일)", [2, 3], index=0)
-    max_workers = st.slider("병렬 스캔 작업수", 2, 20, 10, 1)
+    max_workers = st.slider("병렬 스캔 작업수", 2, 12, 6, 1)
     name_filter = st.text_input("종목명 검색(선택)", "")
     run = st.button("스캔 실행", type="primary", use_container_width=True)
 
-universe = get_universe(limit_kospi=limit_kospi)
-if name_filter.strip():
+if name_filter.strip() and not universe.empty:
     universe = universe[universe["Name"].str.contains(name_filter.strip(), case=False, na=False)].reset_index(drop=True)
 
 st.caption(f"대상 종목 수: {len(universe)}")
@@ -332,28 +357,25 @@ st.caption(f"대상 종목 수: {len(universe)}")
 def scan(universe, start_year, max_workers, required_days):
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     hist = load_hist()
-    results, pending = [], []
-    dfs_cache = {}
+    results, pending, dfs_cache = [], [], {}
 
     prog = st.progress(0)
     msg = st.empty()
-    total = len(universe)
+    total = max(1, len(universe))
 
     def process(row):
         code = str(row["Code"]).zfill(6)
-        name = str(row["Name"])
+        name = str(row.get("Name", code))
         df = get_stock_data(code, start_year)
         if df is None or df.empty or len(df) < 80:
             return None
         ans = detect_wolfe_wave_pattern(df)
         if not ans:
             return None
-
         pat = ans["pattern"]
         sig = "BUY" if "매수" in pat else ("SELL" if "매도" in pat else "NEUTRAL")
         update_hist(hist, code, sig, today)
         is_con, days = check_consec(hist, code, sig, required_days=required_days)
-
         item = {
             "Code": code, "종목명": name, "현재가": int(float(df["Close"].iloc[-1])),
             "패턴유형": pat, "연속일": days,
@@ -371,7 +393,7 @@ def scan(universe, start_year, max_workers, required_days):
             done += 1
             row = futs[f]
             prog.progress(done / total)
-            msg.write(f"스캔 중… {done}/{total} · {row['Name']}")
+            msg.write(f"스캔 중… {done}/{total} · {row.get('Name', row.get('Code'))}")
             try:
                 out = f.result()
                 if out is None:
@@ -390,11 +412,13 @@ def scan(universe, start_year, max_workers, required_days):
     pend_df = pd.DataFrame(pending).sort_values(["강도","괴리율(%)"], ascending=[False, True]) if pending else pd.DataFrame()
     return res_df, pend_df, dfs_cache
 
-if run:
+if run and not universe.empty:
     res_df, pend_df, dfs_cache = scan(universe, start_year, max_workers, required_days)
     st.session_state["res_df"] = res_df
     st.session_state["pend_df"] = pend_df
     st.session_state["dfs_cache"] = dfs_cache
+elif run and universe.empty:
+    st.error("스캔 대상이 비어 있습니다. 코스피200 리스트 갱신을 먼저 해주세요.")
 
 res_df = st.session_state.get("res_df", pd.DataFrame())
 pend_df = st.session_state.get("pend_df", pd.DataFrame())
@@ -406,23 +430,15 @@ with tab1:
     if res_df.empty:
         st.info("연속 신호 결과가 없습니다.")
     else:
-        st.dataframe(
-            res_df[["Code","종목명","현재가","패턴유형","연속일","강도","RSI","괴리율(%)"]],
-            use_container_width=True,
-            hide_index=True,
-            height=420
-        )
+        st.dataframe(res_df[["Code","종목명","현재가","패턴유형","연속일","강도","RSI","괴리율(%)"]],
+                     use_container_width=True, hide_index=True, height=420)
 
 with tab2:
     if pend_df.empty:
         st.write("없음")
     else:
-        st.dataframe(
-            pend_df[["Code","종목명","현재가","패턴유형","연속일","강도","RSI","괴리율(%)"]],
-            use_container_width=True,
-            hide_index=True,
-            height=420
-        )
+        st.dataframe(pend_df[["Code","종목명","현재가","패턴유형","연속일","강도","RSI","괴리율(%)"]],
+                     use_container_width=True, hide_index=True, height=420)
 
 with tab3:
     codes = []
@@ -441,10 +457,9 @@ with tab3:
             row = pend_df[pend_df["Code"] == code].iloc[0].to_dict()
 
         if row:
-            st.markdown(f"**{row['종목명']} ({row['Code']})**  ·  {row['패턴유형']}")
-            st.caption(f"현재가 {row['현재가']:,}  |  강도 {row['강도']:.1f}  |  RSI {row['RSI']:.1f}  |  괴리율 {row['괴리율(%)']:.2f}%")
+            st.markdown(f"**{row['종목명']} ({row['Code']})** · {row['패턴유형']}")
+            st.caption(f"현재가 {row['현재가']:,} | 강도 {row['강도']:.1f} | RSI {row['RSI']:.1f} | 괴리율 {row['괴리율(%)']:.2f}%")
             st.markdown(f"[네이버증권 열기](https://finance.naver.com/item/main.naver?code={row['Code']})")
-
             df = dfs_cache.get(code) or get_stock_data(code, start_year)
-            fig = make_chart(df, row["points"], row["종목명"], row["패턴유형"])
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(make_chart(df, row["points"], row["종목명"], row["패턴유형"]),
+                            use_container_width=True)

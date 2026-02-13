@@ -1,7 +1,8 @@
 streamlit>=1.32
 pandas>=2.0
 numpy>=1.24
-scipy>=1.10
-finance-datareader>=0.9.50
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=4.9
 yfinance>=0.2.30
 plotly>=5.18

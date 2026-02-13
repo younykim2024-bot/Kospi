@@ -1,22 +1,11 @@
-# KOSPI Wolfe Scanner (모바일용)
+# KOSPI Wolfe (Cloud + KOSPI200)
 
-이 버전은 **모바일에서 보기 편하게** UI를 바꾼 Streamlit 웹앱입니다.
-- 화면 폭이 좁아도 잘 보이도록 `layout="centered"` 적용
-- 표/차트는 탭으로 분리
-- 차트는 Plotly 캔들(핀치줌/드래그 가능)
+## 핵심
+- Streamlit Cloud에서 KRX(data.krx.co.kr) 호출이 Access Denied로 막히는 경우가 있어,
+  **KRX를 호출하지 않고** KOSPI200 구성종목을 쓰도록 구성했습니다.
+- `kospi200.csv`가 있으면 그것을 기본 universe로 사용합니다.
+- `kospi200.csv`가 비어있거나 없으면, 네이버 금융 `entryJongmok` 페이지에서 구성종목을 크롤링해 생성합니다.
 
-## 1) 로컬 실행
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-## 2) 모바일에서 쓰는 방법(권장: 무료 배포)
-### Streamlit Community Cloud
-1) 이 폴더를 GitHub에 올리기
-2) Streamlit Cloud에서 repo 연결
-3) Deploy 하면 URL이 생깁니다
-4) 모바일에서 그 URL로 접속
-
-## 3) 홈화면에 바로가기 추가(안드로이드 크롬)
-- 웹앱 열기 → 메뉴(⋮) → '홈 화면에 추가'
+## 참고(근거)
+네이버 금융에서 KOSPI200 편입종목 테이블을 페이지별로 제공하며,
+`entryJongmok.nhn?page=...` 형태로 접근해 종목명/코드를 파싱하는 방식이 널리 사용됩니다.
