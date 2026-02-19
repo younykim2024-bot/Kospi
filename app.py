@@ -291,24 +291,22 @@ def detect_wolfe_wave_pattern(df):
 # Fallback signal (indicator-based)
 # -----------------------------
 def basic_signal(df: pd.DataFrame):
-    """Return a relaxed BUY/SELL/NEUTRAL signal even when Wolfe/Harmonic patterns are not detected.
-    This prevents scan results from becoming empty."""
-    close = df["Close"].astype(float)
+    """Return a relaxed BUY/SELL/NEUTRAL signal using classic indicators.
+    This runs even when Wolfe/Harmonic patterns are not detected, so scan results don't become empty."""
+    d = df.copy()
 
-    rsi_series = calculate_rsi(close, period=14)
-    rsi = float(rsi_series.iloc[-1]) if len(rsi_series) else 50.0
+    # All indicator helpers in this file are DataFrame-based (expect Close/High/Low columns).
+    d["RSI"] = calculate_rsi(d)
+    d = calculate_macd(d)
+    d = calculate_stochastic(d)
+    d = calculate_adx(d)
 
-    macd, signal, hist = calculate_macd(close)
-    macd_v = float(macd.iloc[-1]) if len(macd) else 0.0
-    hist_v = float(hist.iloc[-1]) if len(hist) else 0.0
+    rsi = float(d["RSI"].iloc[-1]) if len(d["RSI"]) else 50.0
+    macd_v = float(d["MACD"].iloc[-1]) if "MACD" in d.columns else 0.0
+    hist_v = float(d["MACD_Histogram"].iloc[-1]) if "MACD_Histogram" in d.columns else 0.0
+    k_v = float(d["K%"].iloc[-1]) if "K%" in d.columns and not np.isnan(d["K%"].iloc[-1]) else 50.0
+    adx = float(d["ADX"].iloc[-1]) if "ADX" in d.columns and not np.isnan(d["ADX"].iloc[-1]) else 0.0
 
-    k, d = calculate_stochastic(df, 14, 3)
-    k_v = float(k.iloc[-1]) if len(k) else 50.0
-
-    adx_series = calculate_adx(df, 14)
-    adx = float(adx_series.iloc[-1]) if len(adx_series) else 0.0
-
-    # Relaxed scoring (designed to produce results similar to pre-AI versions)
     buy_s = 0.0
     if rsi <= 45: buy_s += 1
     if rsi <= 35: buy_s += 1
@@ -325,17 +323,18 @@ def basic_signal(df: pd.DataFrame):
 
     if buy_s >= max(2.0, sell_s + 0.5):
         signal_txt = "BUY"
-        status = f"지표 기반 강한 매수 신호 (RSI {rsi:.1f})"
+        status = f"지표 기반 매수 (RSI {rsi:.1f})"
         strength = buy_s
     elif sell_s >= max(2.0, buy_s + 0.5):
         signal_txt = "SELL"
-        status = f"지표 기반 강한 매도 신호 (RSI {rsi:.1f})"
+        status = f"지표 기반 매도 (RSI {rsi:.1f})"
         strength = sell_s
     else:
         signal_txt = "NEUTRAL"
         status = f"지표 기반 중립 (RSI {rsi:.1f})"
         strength = max(buy_s, sell_s)
 
+    close = d["Close"].astype(float)
     ma20 = close.rolling(20).mean().iloc[-1] if len(close) >= 20 else np.nan
     disparity = float((close.iloc[-1] / ma20 - 1) * 100) if ma20 == ma20 and ma20 != 0 else 0.0
 
@@ -348,45 +347,6 @@ def basic_signal(df: pd.DataFrame):
         "strength": float(min(5.0, strength)),
     }
 
-# -----------------------------
-# Data fetch (yfinance)
-# -----------------------------
-@st.cache_data(ttl=60*60, show_spinner=False)
-def get_stock_data(code: str, start_year: int):
-    start_date = datetime.datetime(start_year, 1, 1)
-    end_date = datetime.datetime.now()
-    code6 = str(code).zfill(6)
-
-    # 1) Prefer FinanceDataReader (KRX/Naver-backed) if available
-    if fdr is not None:
-        try:
-            df = fdr.DataReader(code6, start_date, end_date)
-            if df is not None and not df.empty:
-                df.index = pd.to_datetime(df.index)
-                # Normalize columns to match yfinance style
-                col_map = {c: c.title() for c in df.columns}
-                df = df.rename(columns=col_map)
-                # Ensure required columns exist
-                if "Close" in df.columns:
-                    return df
-        except Exception:
-            pass
-
-    # 2) Fallback to yfinance (.KS/.KQ)
-    for ticker in [f"{code6}.KS", f"{code6}.KQ"]:
-        try:
-            df = yf.Ticker(ticker).history(start=start_date, auto_adjust=False, actions=False, progress=False)
-            if df is not None and not df.empty:
-                return df
-        except Exception:
-            continue
-
-    return pd.DataFrame()
-
-# -----------------------------
-# KOSPI200 list (Naver crawl -> cached csv)
-# -----------------------------
-KOSPI200_CSV = "kospi200.csv"
 
 def load_kospi200_csv():
     if os.path.exists(KOSPI200_CSV):
@@ -550,6 +510,7 @@ def scan(universe, start_year, max_workers, required_days):
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     hist = load_hist()
     results, pending, dfs_cache = [], [], {}
+    fails = []
     ok_cnt, fail_cnt, neutral_cnt = 0, 0, 0
 
     prog = st.progress(0)
@@ -559,12 +520,18 @@ def scan(universe, start_year, max_workers, required_days):
     def process(row):
         code = str(row["Code"]).zfill(6)
         name = str(row.get("Name", code))
-        df = get_stock_data(code, start_year)
+        try:
+            df = get_stock_data(code, start_year)
+        except Exception as e:
+            return ("FAIL", {"Code": code, "종목명": name, "사유": f"데이터 수집 예외: {type(e).__name__}: {e}"})
         if df is None or df.empty or len(df) < 80:
-            return None
-        ans = detect_wolfe_wave_pattern(df)
-        if not ans:
-            ans = basic_signal(df)
+            return ("FAIL", {"Code": code, "종목명": name, "사유": "데이터 없음/부족(<80)"})
+        try:
+            ans = detect_wolfe_wave_pattern(df)
+            if not ans:
+                ans = basic_signal(df)
+        except Exception as e:
+            return ("FAIL", {"Code": code, "종목명": name, "사유": f"분석 예외: {type(e).__name__}: {e}"})
         pat = ans["pattern"]
         sig = ans.get("signal")
         if not sig:
@@ -579,7 +546,7 @@ def scan(universe, start_year, max_workers, required_days):
             "괴리율(%)": float(ans.get("disparity", 0.0)),
             "points": ans["points"],
         }
-        return (is_con, item, df)
+        return ("OK", is_con, item, df)
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(process, row): row for _, row in universe.iterrows()}
@@ -591,21 +558,34 @@ def scan(universe, start_year, max_workers, required_days):
             msg.write(f"스캔 중… {done}/{total} · {row.get('Name', row.get('Code'))}")
             try:
                 out = f.result()
-                if out is None:
+                if not out:
                     fail_cnt += 1
+                    fails.append({"Code": str(row.get("Code")).zfill(6), "종목명": str(row.get("Name", row.get("Code"))), "사유": "알 수 없는 실패"})
                     continue
-                is_con, item, df = out
+
+                status = out[0]
+                if status == "FAIL":
+                    fail_cnt += 1
+                    fails.append(out[1])
+                    continue
+
+                _, is_con, item, df = out
                 ok_cnt += 1
                 if item.get("신호") == "NEUTRAL":
                     neutral_cnt += 1
                 dfs_cache[item["Code"]] = df
                 (results if is_con else pending).append(item)
-            except Exception:
+            except Exception as e:
+                fail_cnt += 1
+                fails.append({"Code": str(row.get("Code")).zfill(6), "종목명": str(row.get("Name", row.get("Code"))), "사유": f"스레드 예외: {type(e).__name__}: {e}"})
                 continue
 
     save_hist(hist)
     msg.write("완료")
     st.info(f"데이터 수집 성공 {ok_cnt} / 실패 {fail_cnt} (중립 {neutral_cnt})")
+    if fails:
+        st.caption("분석 실패(또는 데이터 수집 실패) 종목 목록")
+        st.dataframe(pd.DataFrame(fails), width="stretch", hide_index=True, height=260)
     prog.empty()
 
     res_df = pd.DataFrame(results).sort_values(["강도","괴리율(%)"], ascending=[False, True]) if results else pd.DataFrame()
